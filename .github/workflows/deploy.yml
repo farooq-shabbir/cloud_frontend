@@ -1,87 +1,95 @@
-name: Deploy to EC2
+name: Deploy Docker to EC2
 
 on:
   push:
     branches:
       - main
 
+env:
+  REGISTRY: ghcr.io
+  # github.repository as <account>/<repo>
+  IMAGE_NAME: ${{ github.repository }}
+
 jobs:
-  deploy:
+  build-and-deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
         with:
-          node-version: '20'
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Dependencies
-        run: |
-          cd frontend
-          npm install
-
-      - name: Build Project
-        run: |
-          cd frontend
-          npm run build
-
-      - name: Copy files to EC2
-        uses: appleboy/scp-action@v0.1.7
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
         with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_KEY }}
-          source: "frontend/dist/*,frontend/nginx.conf"
-          target: "/home/${{ secrets.EC2_USER }}/app"
-          strip_components: 1
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha
 
-      - name: Deploy on EC2
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Deploy to EC2
         uses: appleboy/ssh-action@v0.1.10
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_KEY }}
           script: |
-            # Install Nginx if not installed
-            if ! command -v nginx &> /dev/null; then
+            # Update package index and install Docker if not exists
+            if ! command -v docker &> /dev/null; then
                 sudo apt-get update
-                sudo apt-get install -y nginx
+                sudo apt-get install -y ca-certificates curl gnupg
+                sudo install -m 0755 -d /etc/apt/keyrings
+                curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+                sudo chmod a+r /etc/apt/keyrings/docker.gpg
+                echo \
+                  "deb [arch=\"$(dpkg --print-architecture)\" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+                  $(. /etc/os-release && echo \"$VERSION_CODENAME\") stable" | \
+                  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+                sudo apt-get update
+                sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+                
+                # Add current user to docker group to avoid using sudo for docker commands (requires re-login, so we use sudo for now)
+                sudo usermod -aG docker $USER
             fi
 
-            # Create destination directory
-            sudo mkdir -p /var/www/myapp
+            # Login to GitHub Container Registry
+            echo "${{ secrets.GITHUB_TOKEN }}" | sudo docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            # Stop and remove existing container
+            sudo docker stop myapp || true
+            sudo docker rm myapp || true
+
+            # Pull the latest image
+            # We need to lowercase the image name because docker requires lowercase
+            IMAGE_URL=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" | tr '[:upper:]' '[:lower:]')
             
-            # Move build files
-            # The scp action puts files in /home/user/app/frontend/dist -> we need to handle the path carefully
-            # scp strip_components: 1 removes 'frontend/' so we might have 'dist/' and 'nginx.conf' in target
-            
-            # Let's check what we have. 
-            # We copied "frontend/dist/*" and "frontend/nginx.conf"
-            # With strip_components: 1, if we target /home/user/app
-            # We should get /home/user/app/dist/ and /home/user/app/nginx.conf
-            
-            # Move static files
-            sudo cp -r /home/${{ secrets.EC2_USER }}/app/dist/* /var/www/myapp/
-            
-            # Setup Nginx
-            sudo cp /home/${{ secrets.EC2_USER }}/app/nginx.conf /etc/nginx/sites-available/myapp
-            
-            # Update Nginx config root path if needed (our config says /usr/share/nginx/html, we should change it to /var/www/myapp)
-            # OR we just update the file we wrote locally to point to /var/www/myapp.
-            # Let's update the local file first before pushing, it is cleaner. 
-            # But for now I will use sed to replace it on the fly or just overwrite.
-            
-            # Actually, I should have set the root in nginx.conf correctly.
-            # I will update nginx.conf in the next step to point to /var/www/myapp.
-            
-            sudo ln -sf /etc/nginx/sites-available/myapp /etc/nginx/sites-enabled/
-            
-            # Remove default if it exists and conflicts (default listens on 80, we listen on 3000, so no conflict on port, but good practice)
-            # sudo rm /etc/nginx/sites-enabled/default 
-            
-            # Test and Restart Nginx
-            sudo nginx -t
-            sudo systemctl restart nginx
+            sudo docker pull $IMAGE_URL
+
+            # Run the new container
+            # Mapping host port 3000 to container port 3000
+            sudo docker run -d \
+              --name myapp \
+              --restart always \
+              -p 3000:3000 \
+              $IMAGE_URL
+
+            # Prune unused images to save space
+            sudo docker image prune -f
