@@ -77,6 +77,10 @@ jobs:
             sudo docker stop myapp || true
             sudo docker rm myapp || true
 
+            # Kill any other process using port 3000 to avoid "address already in use" errors
+            # This handles cases where a previous non-docker nginx or another app is still running
+            sudo fuser -k 3000/tcp || true
+
             # Pull the latest image
             # We need to lowercase the image name because docker requires lowercase
             IMAGE_URL=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" | tr '[:upper:]' '[:lower:]')
