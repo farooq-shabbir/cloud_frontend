@@ -85,12 +85,23 @@ jobs:
           command: |
             # Setup SSH
             mkdir -p ~/.ssh
-            echo "$EC2_SSH_KEY" > ~/.ssh/id_rsa
+            
+            # Robustly handle the private key:
+            # 1. Replace literal "\n" with actual newlines (common copy-paste issue)
+            # 2. Ensure the file ends with a newline
+            echo "$EC2_SSH_KEY" | sed 's/\\n/\n/g' > ~/.ssh/id_rsa
+            
+            # Check if key looks roughly valid (starts with -----BEGIN) without revealing it
+            if ! grep -q "BEGIN" ~/.ssh/id_rsa; then
+              echo "Error: EC2_SSH_KEY does not look like a valid PEM key. Please check your CircleCI Environment Variable."
+              exit 1
+            fi
+            
             chmod 600 ~/.ssh/id_rsa
             ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts
             
             # Execute Remote Script
-            ssh -o StrictHostKeyChecking=no $EC2_USER@$EC2_HOST \<< EOF
+            ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no $EC2_USER@$EC2_HOST \<< EOF
               set -e
 
               # ---------------------------------------------------
