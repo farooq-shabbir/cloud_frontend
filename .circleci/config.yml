@@ -86,18 +86,60 @@ jobs:
             # Setup SSH
             mkdir -p ~/.ssh
             
-            # Robustly handle the private key:
-            # 1. Replace literal "\n" with actual newlines (common copy-paste issue)
-            # 2. Ensure the file ends with a newline
-            echo "$EC2_SSH_KEY" | sed 's/\\n/\n/g' > ~/.ssh/id_rsa
+            # Use Python to robustly format the SSH key
+            # This handles:
+            # 1. Literal "\n" characters (common in CI variables)
+            # 2. Flattened keys (single line with spaces)
+            # 3. Missing newlines
+            python3 -c '
+            import os
+            import sys
+
+            key = os.environ.get("EC2_SSH_KEY", "").strip()
+            if not key:
+                print("Error: EC2_SSH_KEY is empty")
+                sys.exit(1)
+
+            # Fix literal \n (common if pasted as single line in some UIs)
+            key = key.replace("\\n", "\n")
+
+            # Check for flattened keys (one line, spaces instead of newlines)
+            # This happens if the key was pasted into a field that strips newlines
+            if "\n" not in key and "BEGIN" in key:
+                print("Detected flattened key. Attempting to reconstruct...")
+                # supported headers
+                headers = [
+                    ("-----BEGIN RSA PRIVATE KEY-----", "-----END RSA PRIVATE KEY-----"),
+                    ("-----BEGIN OPENSSH PRIVATE KEY-----", "-----END OPENSSH PRIVATE KEY-----"),
+                    ("-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----")
+                ]
+                
+                for h, f in headers:
+                    if h in key and f in key:
+                        # Extract body: remove headers/footers and all whitespace
+                        body = key.replace(h, "").replace(f, "").replace(" ", "")
+                        # Chunk body into 64 chars (standard PEM)
+                        chunked = "\n".join(body[i:i+64] for i in range(0, len(body), 64))
+                        key = f"{h}\n{chunked}\n{f}"
+                        break
+
+            # Write to file with trailing newline
+            path = os.path.expanduser("~/.ssh/id_rsa")
+            with open(path, "w") as f:
+                f.write(key + "\n")
             
-            # Check if key looks roughly valid (starts with -----BEGIN) without revealing it
+            print(f"Key written to {path}")
+            '
+            
+            # Set permissions and verify
+            chmod 600 ~/.ssh/id_rsa
+            
             if ! grep -q "BEGIN" ~/.ssh/id_rsa; then
-              echo "Error: EC2_SSH_KEY does not look like a valid PEM key. Please check your CircleCI Environment Variable."
+              echo "Error: Generated key does not look valid."
+              cat ~/.ssh/id_rsa # Safe to print header? No, better not print private key in logs.
               exit 1
             fi
-            
-            chmod 600 ~/.ssh/id_rsa
+
             ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts
             
             # Execute Remote Script
