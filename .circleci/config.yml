@@ -1,0 +1,287 @@
+version: 2.1
+
+orbs:
+  docker: circleci/docker@2.4.0
+
+jobs:
+  test:
+    docker:
+      - image: cimg/node:20.11.0
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-deps-{{ checksum "frontend/package-lock.json" }}
+            - v1-deps-
+      - run:
+          name: Install Dependencies
+          command: |
+            cd frontend
+            npm ci
+      - save_cache:
+          paths:
+            - frontend/node_modules
+          key: v1-deps-{{ checksum "frontend/package-lock.json" }}
+      - run:
+          name: Run Linting
+          command: |
+            cd frontend
+            npm run lint
+      - store_artifacts:
+          path: frontend/eslint.config.js # Just an example artifact
+          destination: lint-config
+
+  build:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: 20.10.14
+          docker_layer_caching: false # Set to true if you have a paid plan
+      - run:
+          name: Build and Push Docker Image
+          command: |
+            # Retry function
+            retry() {
+              local n=1
+              local max=3
+              local delay=5
+              while true; do
+                "$@" && break || {
+                  if [[ $n -lt $max ]]; then
+                    ((n++))
+                    echo "Command failed. Attempt $n/$max:"
+                    sleep $delay;
+                  else
+                    echo "The command has failed after $n attempts."
+                    return 1
+                  fi
+                }
+              done
+            }
+
+            # Login to Docker Hub
+            echo "$DOCKER_PASSWORD" | retry docker login -u "$DOCKER_USER" --password-stdin
+
+            # Variables
+            IMAGE_TAG="${DOCKER_USER}/${DOCKER_REPO}:${CIRCLE_SHA1}"
+            LATEST_TAG="${DOCKER_USER}/${DOCKER_REPO}:latest"
+
+            echo "Building image: $IMAGE_TAG"
+            
+            # Build
+            docker build -f frontend/Dockerfile.circleci -t $IMAGE_TAG -t $LATEST_TAG frontend/
+
+            # Push with retry
+            retry docker push $IMAGE_TAG
+            retry docker push $LATEST_TAG
+
+  deploy:
+    machine:
+      image: ubuntu-2204:current
+    steps:
+      - run:
+          name: Deploy to EC2 with Rollback Strategy
+          command: |
+            # Setup SSH
+            mkdir -p ~/.ssh
+            echo "$EC2_SSH_KEY" > ~/.ssh/id_rsa
+            chmod 600 ~/.ssh/id_rsa
+            ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts
+            
+            # Execute Remote Script
+            ssh -o StrictHostKeyChecking=no $EC2_USER@$EC2_HOST << 'EOF'
+              set -e
+
+              # ---------------------------------------------------
+              # Helper Functions
+              # ---------------------------------------------------
+              retry() {
+                local n=1
+                local max=3
+                local delay=5
+                while true; do
+                  "$@" && break || {
+                    if [[ $n -lt $max ]]; then
+                      ((n++))
+                      echo "Command failed. Attempt $n/$max:"
+                      sleep $delay;
+                    else
+                      echo "The command has failed after $n attempts."
+                      return 1
+                    fi
+                  }
+                done
+              }
+
+              check_health() {
+                local url="http://localhost:3035"
+                local max_attempts=12 # 1 minute total (12 * 5s)
+                local attempt=1
+                
+                echo "Checking health at $url..."
+                while [ $attempt -le $max_attempts ]; do
+                  if curl -s -f "$url" > /dev/null; then
+                    echo "Health check passed!"
+                    return 0
+                  fi
+                  echo "Health check attempt $attempt/$max_attempts failed. Retrying in 5s..."
+                  sleep 5
+                  ((attempt++))
+                done
+                
+                echo "Health check failed after $max_attempts attempts."
+                return 1
+              }
+
+              # ---------------------------------------------------
+              # Configuration
+              # ---------------------------------------------------
+              CONTAINER_NAME="myapp-circleci"
+              BACKUP_NAME="myapp-circleci-backup"
+              PORT=3035
+              # Note: Variables from local env are not directly available here unless passed or set in env
+              # We assume these are available in the shell or we need to pass them.
+              # Since this is a quoted 'EOF', variables are NOT expanded locally.
+              # We need to export them in the outer script or use unquoted EOF.
+              # Switching strategy: We will pass variables via SSH env or unquote EOF.
+              # Using unquoted EOF for variable expansion, but need to be careful with $ inside script.
+            EOF
+
+            # Re-running ssh with unquoted EOF to pass local variables
+            # Escaping $ for remote variables
+            ssh -o StrictHostKeyChecking=no $EC2_USER@$EC2_HOST << EOF
+              # 1. Install Docker if not exists
+              if ! command -v docker &> /dev/null; then
+                  echo "Installing Docker..."
+                  sudo apt-get update
+                  sudo apt-get install -y ca-certificates curl gnupg
+                  sudo install -m 0755 -d /etc/apt/keyrings
+                  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+                  sudo chmod a+r /etc/apt/keyrings/docker.gpg
+                  echo \
+                    "deb [arch=\"\$(dpkg --print-architecture)\" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+                    \$(. /etc/os-release && echo \"\$VERSION_CODENAME\") stable" | \
+                    sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+                  sudo apt-get update
+                  sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+                  sudo usermod -aG docker \$USER
+              fi
+
+              # Define Functions again (since previous block was separate)
+              retry() {
+                local n=1
+                local max=3
+                local delay=5
+                while true; do
+                  "\$@" && break || {
+                    if [[ \$n -lt \$max ]]; then
+                      ((n++))
+                      echo "Command failed. Attempt \$n/\$max:"
+                      sleep \$delay;
+                    else
+                      echo "The command has failed after \$n attempts."
+                      return 1
+                    fi
+                  }
+                done
+              }
+
+              # 2. Login to Docker Hub
+              echo "$DOCKER_PASSWORD" | retry sudo docker login -u "$DOCKER_USER" --password-stdin
+
+              # 3. Pull latest image
+              IMAGE_TAG="${DOCKER_USER}/${DOCKER_REPO}:${CIRCLE_SHA1}"
+              echo "Pulling image: \$IMAGE_TAG"
+              retry sudo docker pull \$IMAGE_TAG
+
+              # 4. Prepare Rollback
+              CONTAINER_NAME="myapp-circleci"
+              BACKUP_NAME="myapp-circleci-backup"
+              
+              echo "Checking for existing container..."
+              if sudo docker ps -a --format '{{.Names}}' | grep -q "^\${CONTAINER_NAME}\$"; then
+                echo "Existing container found. Backing up..."
+                # Stop and rename
+                sudo docker stop \$CONTAINER_NAME || true
+                sudo docker rename \$CONTAINER_NAME \$BACKUP_NAME
+                # Ensure backup is stopped
+                sudo docker stop \$BACKUP_NAME || true
+              else
+                echo "No existing container found. Skipping backup."
+              fi
+
+              # 5. Run New Container
+              echo "Starting new container..."
+              # Ensure port is free (though we just stopped the container using it)
+              sudo fuser -k 3035/tcp || true
+              
+              sudo docker run -d \
+                --name \$CONTAINER_NAME \
+                --restart always \
+                -p 3035:3035 \
+                \$IMAGE_TAG
+
+              # 6. Health Check
+              echo "Performing health check..."
+              HEALTH_CHECK_PASSED=false
+              
+              for i in {1..12}; do
+                if curl -s -f http://localhost:3035 > /dev/null; then
+                  echo "Health check passed!"
+                  HEALTH_CHECK_PASSED=true
+                  break
+                fi
+                echo "Health check attempt \$i/12 failed. Waiting 5s..."
+                sleep 5
+              done
+
+              # 7. Rollback or Cleanup
+              if [ "\$HEALTH_CHECK_PASSED" = true ]; then
+                echo "Deployment successful."
+                if sudo docker ps -a --format '{{.Names}}' | grep -q "^\${BACKUP_NAME}\$"; then
+                  echo "Removing backup container..."
+                  sudo docker rm -f \$BACKUP_NAME
+                fi
+              else
+                echo "Health check FAILED. Initiating ROLLBACK..."
+                
+                # Stop and remove the broken new container
+                sudo docker rm -f \$CONTAINER_NAME
+                
+                # Restore backup if it exists
+                if sudo docker ps -a --format '{{.Names}}' | grep -q "^\${BACKUP_NAME}\$"; then
+                  echo "Restoring backup container..."
+                  sudo docker rename \$BACKUP_NAME \$CONTAINER_NAME
+                  sudo docker start \$CONTAINER_NAME
+                  echo "Rollback completed. Previous version is running."
+                else
+                  echo "No backup found to rollback to. Deployment failed and service is down."
+                fi
+                
+                exit 1
+              fi
+
+              # 8. Space Optimization
+              echo "Pruning unused images..."
+              sudo docker image prune -f
+            EOF
+
+workflows:
+  version: 2
+  build-test-deploy:
+    jobs:
+      - test
+      - build:
+          requires:
+            - test
+          filters:
+            branches:
+              only: main
+      - deploy:
+          requires:
+            - build
+          filters:
+            branches:
+              only: main
