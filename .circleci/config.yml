@@ -37,7 +37,6 @@ jobs:
     steps:
       - checkout
       - setup_remote_docker:
-          version: 20.10.14
           docker_layer_caching: false # Set to true if you have a paid plan
       - run:
           name: Build and Push Docker Image
