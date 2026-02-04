@@ -1,0 +1,30 @@
+# Stage 1: Build the React application
+FROM node:20 AS builder
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm install
+
+COPY . .
+RUN npm run build
+
+# Stage 2: Serve the application with Nginx
+FROM nginx:alpine
+
+# Remove default Nginx configuration
+RUN rm /etc/nginx/conf.d/default.conf
+
+# Copy custom Nginx configuration
+COPY nginx.jenkins.conf /etc/nginx/conf.d/default.conf
+
+# Create the directory structure expected by nginx.conf
+RUN mkdir -p /var/www/myapp
+
+# Copy built assets from builder stage to the custom path
+COPY --from=builder /app/dist /var/www/myapp
+
+# Expose port 3038
+EXPOSE 3038
+
+CMD ["nginx", "-g", "daemon off;"]
