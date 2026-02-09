@@ -7,7 +7,7 @@ pipeline {
         EC2_SSH_KEY  = credentials('ec2-ssh-key')            // SSH Private Key (Secret file or text)
         EC2_HOST     = credentials('ec2-server-ip')          // Secret Text credential containing IP
         EC2_USER     = 'ubuntu'
-        DOCKER_REPO  = 'your-username/repo-name'
+        DOCKER_REPO  = credentials('docker-repo')            // Secret Text credential containing 'username/repo'
         IMAGE_TAG    = "${DOCKER_REPO}:${BUILD_NUMBER}"
         LATEST_TAG   = "${DOCKER_REPO}:latest"
         CONTAINER_NAME = "myapp-jenkins"
