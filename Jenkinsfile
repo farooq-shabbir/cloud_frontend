@@ -5,7 +5,7 @@ pipeline {
         // Credentials should be configured in Jenkins Credentials Manager
         DOCKER_CREDS = credentials('docker-hub-credentials') // Username/Password
         EC2_SSH_KEY  = credentials('ec2-ssh-key')            // SSH Private Key (Secret file or text)
-        EC2_HOST     = '1.2.3.4'                             // Replace with your EC2 IP or use env var
+        EC2_HOST     = credentials('ec2-server-ip')          // Secret Text credential containing IP
         EC2_USER     = 'ubuntu'
         DOCKER_REPO  = 'your-username/repo-name'
         IMAGE_TAG    = "${DOCKER_REPO}:${BUILD_NUMBER}"
